@@ -26,9 +26,19 @@
 #ifndef DEFS_H
 #define DEFS_H
 
-// #define COMPILE_FOR_ATMELSTUDIO7
+#ifndef FALSE
+#define FALSE 0
+#endif
 
-#ifdef COMPILE_FOR_ATMELSTUDIO7
+#ifndef TRUE
+#define TRUE !FALSE
+#endif
+
+#define COMPILE_FOR_ATMELSTUDIO7 FALSE
+#define HARDWARE_EXTERNAL_DIP_PULLUPS_INSTALLED FALSE
+#define CAL_SIGNAL_ON_PD3 FALSE
+
+#if COMPILE_FOR_ATMELSTUDIO7
 	#include <avr/io.h>
 	#include <util/delay.h>
 	#include <avr/interrupt.h>
@@ -52,12 +62,15 @@
 #define OUTPUT 0x1
 #endif
 
-/* #define F_CPU 16000000UL / * gets declared in makefile * / */
+#ifndef INPUT_PULLUP
+#define INPUT_PULLUP 0x3
+#endif
 
+/* #define F_CPU 16000000UL / * gets declared in makefile * / */
 
 /******************************************************
  * Set the text that gets displayed to the user */
-#define SW_REVISION "0.10"
+#define SW_REVISION "0.16"
 
 //#define TRANQUILIZE_WATCHDOG
 
@@ -85,13 +98,19 @@ typedef unsigned char uint8_t;
 #define null 0
 #endif
 
-#define PIN_NANO_LED 13
-#define PIN_NANO_KEY 2
-#define PIN_NANO_SYNC 3
-#define PIN_NANO_DIP_0 4
-#define PIN_NANO_DIP_1 5
-#define PIN_NANO_DIP_2 6
+#define PIN_MORSE_KEY 2
+#define PIN_SYNC 3
+#define PIN_DIP_0 4
+#define PIN_DIP_1 5
+#define PIN_DIP_2 6
+#define PIN_UNUSED_7 7
+#define PIN_UNUSED_8 8
 #define PIN_AUDIO_OUT 9
+#define PIN_UNUSED_10 10
+#define PIN_CAL_OUT 11
+#define PIN_UNUSED_12 12
+#define PIN_LED 13
+
 
 typedef enum {
 BEACON = 0,
@@ -120,8 +139,6 @@ INVALID_FOX
 #define MAX_CODE_SPEED_WPM 20
 #define MIN_CODE_SPEED_WPM 5
 
-#define USE_WATCHDOG
-
 typedef enum
 {
 	WD_SW_RESETS,
@@ -139,7 +156,7 @@ typedef enum
 
 /******************************************************
  * EEPROM definitions */
-#define EEPROM_INITIALIZED_FLAG 0xB3
+#define EEPROM_INITIALIZED_FLAG 0xB4
 #define EEPROM_UNINITIALIZED 0x00
 
 #define EEPROM_STATION_ID_DEFAULT "FOXBOX"
@@ -158,32 +175,7 @@ typedef enum
 #define EEPROM_TEMP_CALIBRATION_DEFAULT 147
 #define EEPROM_OVERRIDE_DIP_SW_DEFAULT 0
 #define EEPROM_ENABLE_LEDS_DEFAULT 1
-#define EEPROM_ENABLE_SYNC_DEFAULT 1
 #define EEPROM_ENABLE_STARTTIMER_DEFAULT 1
-
-#define EEPROM_SI5351_CALIBRATION_DEFAULT 0x00
-#define EEPROM_CLK0_OUT_DEFAULT 133000000
-#define EEPROM_CLK1_OUT_DEFAULT 70000000
-#define EEPROM_CLK2_OUT_DEFAULT 10700000
-#define EEPROM_CLK0_ONOFF_DEFAULT OFF
-#define EEPROM_CLK1_ONOFF_DEFAULT OFF
-#define EEPROM_CLK2_ONOFF_DEFAULT OFF
-
-#define EEPROM_BATTERY_EMPTY_MV 3430
-
-/******************************************************
- * General definitions for making the code easier to understand */
-#define         SDA_PIN (1 << PINC4)
-#define         SCL_PIN (1 << PINC5)
-#define         I2C_PINS (SCL_PIN | SDA_PIN)
-
-#ifndef FALSE
-   #define FALSE 0
-#endif
-
-#ifndef TRUE
-   #define TRUE !FALSE
-#endif
 
 #ifndef BOOL
 	typedef uint8_t BOOL;
@@ -197,10 +189,9 @@ typedef enum
 #define UINT16_MAX __INT16_MAX__
 #endif
 
-#define ON              1
 #define OFF             0
+#define ON              1
 #define TOGGLE			2
-
 #define UNDETERMINED	3
 
 #define MIN(A,B)    ({ __typeof__(A) __a = (A); __typeof__(B) __b = (B); __a < __b ? __a : __b; })
@@ -216,6 +207,7 @@ typedef enum
 #define MAX_TIME 4294967295L
 #define MAX_UINT16 65535
 #define MAX_INT16 32767
+#define MIN_INT16 -32768
 
 /* Periodic TIMER2 interrupt timing definitions */
 #define TIMER2_57HZ 10

@@ -28,7 +28,7 @@
 #include "linkbus.h"
 #include "defs.h"
 
-#ifdef COMPILE_FOR_ATMELSTUDIO7
+#if COMPILE_FOR_ATMELSTUDIO7
 #include <string.h>
 #include <stdio.h>
 #endif  /* COMPILE_FOR_ATMELSTUDIO7 */
@@ -49,7 +49,6 @@ static const char textHelp[][23] = { "\nCommands:\n",
 									 "  RST - Reset\n",
 									 "  SPD - ID code speed\n",
 									 "  STA - Start tones\n",
-									 "  SYN - Sync on/off\n",
 									 "  TEM - Temperature\n",
 									 "  VER - S/W version\n" };
 

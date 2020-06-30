@@ -32,8 +32,9 @@
 #include "defs.h"
 #include "linkbus.h"
 #include "morse.h"
+#include <avr/wdt.h>
 
-#ifdef COMPILE_FOR_ATMELSTUDIO7
+#if COMPILE_FOR_ATMELSTUDIO7
 #include <avr/io.h>
 #include <avr/eeprom.h>
 #include <string.h>
@@ -44,10 +45,6 @@
 #include "delay.h"
 #include "ardooweeno.h"
 #endif  /* COMPILE_FOR_ATMELSTUDIO7 */
-
-#ifdef USE_WATCHDOG
-#include <avr/wdt.h>
-#endif
 
 #define MAX_PATTERN_TEXT_LENGTH 20
 #define TEMP_STRING_LENGTH (MAX_PATTERN_TEXT_LENGTH + 10)
@@ -75,8 +72,11 @@ volatile int g_startclock_interval = 60;
 
 volatile BOOL g_audio_tone_on = FALSE;
 volatile uint8_t g_lastSeconds = 0x00;
+volatile int16_t g_sync_pin_timer = 0;
+volatile BOOL g_sync_pin_stable = FALSE;
+volatile BOOL g_sync_enabled = TRUE;
 
-#ifndef COMPILE_FOR_ATMELSTUDIO7
+#if !COMPILE_FOR_ATMELSTUDIO7
 	FoxType& operator++ (FoxType & orig)
 	{
 		orig = static_cast < FoxType > (orig + 1);  /* static_cast required because enum + int -> int */
@@ -98,6 +98,28 @@ volatile uint8_t g_lastSeconds = 0x00;
 	{
 		return( a = static_cast < FoxType > (a + b));
 	}
+
+	FoxType& operator-- (FoxType & orig)
+	{
+		orig = static_cast < FoxType > (orig - 1);  /* static_cast required because enum - int -> int */
+		if(orig < BEACON)
+		{
+			orig = BEACON;
+		}
+		return( orig);
+	}
+
+	FoxType operator-- (FoxType & orig, int)
+	{
+		FoxType rVal = orig;
+		--orig;
+		return(rVal);
+	}
+
+	FoxType& operator -= (FoxType & a, int b)
+	{
+		return( a = static_cast < FoxType > (a - b));
+	}
 #endif  /* COMPILE_FOR_ATMELSTUDIO7 */
 
 
@@ -117,7 +139,6 @@ static uint16_t EEMEM ee_ID_time;
 static uint16_t EEMEM ee_clock_calibration;
 static uint8_t EEMEM ee_override_DIP_switches;
 static uint8_t EEMEM ee_enable_LEDs;
-static uint8_t EEMEM ee_enable_sync;
 static int16_t EEMEM ee_temp_calibration;
 static uint8_t EEMEM ee_enable_start_timer;
 
@@ -130,12 +151,9 @@ static volatile uint16_t g_clock_calibration = EEPROM_CLOCK_CALIBRATION_DEFAULT;
 static volatile int16_t g_temp_calibration = EEPROM_TEMP_CALIBRATION_DEFAULT;
 static volatile uint8_t g_override_DIP_switches = EEPROM_OVERRIDE_DIP_SW_DEFAULT;
 static volatile uint8_t g_enable_LEDs;
-static volatile uint8_t g_enable_sync;
 static volatile uint8_t g_enable_start_timer;
 
 static char g_tempStr[TEMP_STRING_LENGTH] = { '\0' };
-
-static volatile uint8_t g_start_override = FALSE;
 
 /*
  * Function Prototypes
@@ -149,12 +167,9 @@ void setUpTemp(void);
 void sendMorseTone(BOOL onOff);
 void playStartingTone(uint8_t toneFreq);
 void wdt_init(WDReset resetType);
+void doSynchronization(void);
 
-#ifndef USE_WATCHDOG
-	void (* resetFunc)(void) = 0;   /*declare reset function @ address 0 */
-#endif
-
-#ifdef COMPILE_FOR_ATMELSTUDIO7
+#if COMPILE_FOR_ATMELSTUDIO7
 	void loop(void);
 	int main(void)
 #else
@@ -163,7 +178,7 @@ void wdt_init(WDReset resetType);
 {
 	while(initializeEEPROMVars())
 	{
-		;                                                                                                                                                                                   /* Initialize variables stored in EEPROM */
+		;                                                                                                                                                                                                                                                                                                                                                                           /* Initialize variables stored in EEPROM */
 	}
 
 	setUpTemp();
@@ -171,35 +186,40 @@ void wdt_init(WDReset resetType);
 	cli();                          /*stop interrupts for setup */
 
 	/* set pins as outputs */
-	pinMode(PIN_NANO_LED, OUTPUT);  /* The nano amber LED: This led blinks when off cycle and blinks with code when on cycle. */
-	digitalWrite(PIN_NANO_LED, OFF);
-	pinMode(PIN_NANO_KEY, OUTPUT);  /* This pin is used to control the KEY line to the transmittter only active on cycle. */
-	digitalWrite(PIN_NANO_KEY, OFF);
+	pinMode(PIN_LED, OUTPUT);       /* The nano amber LED: This led blinks when off cycle and blinks with code when on cycle. */
+	digitalWrite(PIN_LED, OFF);
+	pinMode(PIN_MORSE_KEY, OUTPUT); /* This pin is used to control the KEY line to the transmittter only active on cycle. */
+	digitalWrite(PIN_MORSE_KEY, OFF);
 	pinMode(PIN_AUDIO_OUT, OUTPUT);
 	digitalWrite(PIN_AUDIO_OUT, OFF);
 
-/* set the pins that are inputs */
-	pinMode(PIN_NANO_SYNC, INPUT);      /* This pin is used as the sync line
-	                                     * NOTE: The original albq PIC controllers used the CPU reset line as the
-	                                     * sync line. We had issues with transmitters getting out of sync during transport.
-	                                     * later investigation found that ESD events during transport was resetting the
-	                                     * PIC. This code will read this I/O line for sync and after finding that the I/O line
-	                                     * has switched to the high state it never reads it again until a power cycle.
-	                                     * The Arduino reset line does not go off board. ESD event caused out of sync issue fixed. */
-	pinMode(PIN_NANO_DIP_0, INPUT);     /* fox switch LSB */
-	pinMode(PIN_NANO_DIP_1, INPUT);     /* fox switch middle bit */
-	pinMode(PIN_NANO_DIP_2, INPUT);     /* fox switch MSB */
+	pinMode(PIN_SYNC, INPUT_PULLUP);    /* Sync button */
+	pinMode(PIN_DIP_0, INPUT_PULLUP);   /* DIP switch LSB */
+	pinMode(PIN_DIP_1, INPUT_PULLUP);   /* DIP switch middle bit */
+	pinMode(PIN_DIP_2, INPUT_PULLUP);   /* DIP switch MSB */
+	digitalWrite(PIN_LED, OFF);         /* Turn off led sync switch is now open */
 
-	digitalWrite(PIN_NANO_LED, OFF);    /* Turn off led sync switch is now open */
+	/* Set unused pins as outputs pulled high */
+	pinMode(PIN_UNUSED_7, INPUT_PULLUP);
+	pinMode(PIN_UNUSED_8, INPUT_PULLUP);
+	pinMode(PIN_UNUSED_10, INPUT_PULLUP);
+	pinMode(PIN_UNUSED_12, INPUT_PULLUP);
+	pinMode(A0, INPUT_PULLUP);
+	pinMode(A1, INPUT_PULLUP);
+	pinMode(A2, INPUT_PULLUP);
+	pinMode(A3, INPUT_PULLUP);
+#if !CAL_SIGNAL_ON_PD3
+	pinMode(PIN_CAL_OUT, INPUT_PULLUP);
+#endif
 
-/* set timer1 interrupt at 1Hz */
-	TCCR1A = 0;                         /* set entire TCCR1A register to 0 */
-	TCCR1B = 0;                         /* same for TCCR1B */
-	TCNT1 = 0;                          /*initialize counter value to 0 */
+	/* set timer1 interrupt at 1Hz */
+	TCCR1A = 0; /* set entire TCCR1A register to 0 */
+	TCCR1B = 0; /* same for TCCR1B */
+	TCNT1 = 0;  /*initialize counter value to 0 */
 
 /* Set compare match register for 1hz increments
  ************************************************************
- ** USE THIS TO FIX BOARD PROCESSOR CLOCK ERROR
+ ** USE THIS TO CALIBRATE FOR BOARD PROCESSOR CLOCK ERROR
  ************************************************************/
 	/* first testing found bad drift relative to a gps stable clock (iphone timer) is was 10 seconds in about 50 minutes
 	 * Today I measured the Arduino nano 16 Mhz clock and it was 16.050 MHz. Yes 50 Khz high!!
@@ -222,8 +242,14 @@ void wdt_init(WDReset resetType);
 	TCCR2A = 0;
 	TCCR2B = 0;
 	TCCR2A |= (1 << WGM21);                             /* set Clear Timer on Compare Match (CTC) mode with OCR2A setting the top */
+#if CAL_SIGNAL_ON_PD3
+		pinMode(PIN_CAL_OUT, OUTPUT);                   /* 601Hz Calibration Signal */
+		TCCR2A |= (1 << COM2A0);                        /* Toggle OC2A (PB3) on compare match */
+#endif /* CAL_SIGNAL_ON_PD3 */
 	TCCR2B |= (1 << CS22) | (1 << CS21) | (1 << CS20);  /* 1024 Prescaler */
+
 	OCR2A = 0x0C;                                       /* set frequency to ~300 Hz (0x0c) */
+	OCR2B = 0x00;
 	/* Use system clock for Timer/Counter2 */
 	ASSR &= ~(1 << AS2);
 	/* Reset Timer/Counter2 Interrupt Mask Register */
@@ -233,17 +259,22 @@ void wdt_init(WDReset resetType);
 	/* Timer 0 is for audio Start tone generation and control
 	 * Note: Do not use millis() or DELAY() after TIMER0 has been reconfigured here! */
 	TCCR0A = 0x00;
-/*	TCCR0A |= (1 << COM0A0) | (1 << WGM01);  / * Set toggle OC0A, CTC mode * / */
-	TCCR0A |= (1 << WGM01); /* Set CTC mode */
+	TCCR0A |= (1 << WGM01);     /* Set CTC mode */
 	TCCR0B = 0x00;
-	TCCR0B |= (1 << CS02);  /* Prescale 256 */
+	TCCR0B |= (1 << CS02);      /* Prescale 256 */
 	OCR0A = DEFAULT_TONE_FREQUENCY;
 	TIMSK0 = 0x00;
 	TIMSK0 |= (1 << OCIE0A);
 
-	sei();              /*allow interrupts. Arm and run */
+	/* Sync button pin change interrupt */
+	PCMSK2 = 0x00;
+	PCMSK2 = (1 << PCINT19);    /* Enable PCINT19 */
+	PCICR = 0x00;
+	PCICR = (1 << PCIE2);       /* Enable pin change interrupt 2 */
 
-	linkbus_init(BAUD); /* Start the Link Bus serial comms */
+	sei();                      /*allow interrupts. Arm and run */
+
+	linkbus_init(BAUD);         /* Start the Link Bus serial comms */
 
 	lb_send_string((char*)"\n\nStored Data:\n", TRUE);
 	sprintf(g_tempStr, "  ID: %s\n", g_messages_text[STATION_ID]);
@@ -254,63 +285,43 @@ void wdt_init(WDReset resetType);
 	lb_send_string(g_tempStr, TRUE);
 	sprintf(g_tempStr, "  LED: %s\n", g_enable_LEDs ? "ON" : "OFF");
 	lb_send_string(g_tempStr, TRUE);
-	sprintf(g_tempStr, "  SYN: %s\n", g_enable_sync ? "ON" : "OFF");
-	lb_send_string(g_tempStr, TRUE);
 	sprintf(g_tempStr, "  STA: %s\n", g_enable_start_timer ? "ON" : "OFF");
 	lb_send_string(g_tempStr, TRUE);
 	lb_send_NewPrompt();
 
 	if(g_override_DIP_switches)
 	{
-		g_fox = (FoxType)g_override_DIP_switches;
+		g_fox = CLAMP(BEACON, (FoxType)g_override_DIP_switches, INVALID_FOX);
+		if(g_fox == INVALID_FOX)
+		{
+			g_fox = BEACON;
+		}
 	}
-	else                                            /* Read DIP Switches */
+	else                                    /* Read DIP Switches */
 	{
-		if(digitalRead(PIN_NANO_DIP_0) == HIGH )    /*Lsb */
+		if(digitalRead(PIN_DIP_0) == LOW)   /*Lsb */
 		{
 			g_fox++;
 		}
-		if(digitalRead(PIN_NANO_DIP_1) == HIGH )    /* middle bit */
+		if(digitalRead(PIN_DIP_1) == LOW)   /* middle bit */
 		{
 			g_fox += 2;
 		}
-		if(digitalRead(PIN_NANO_DIP_2) == HIGH )    /* MSB */
+		if(digitalRead(PIN_DIP_2) == LOW)   /* MSB */
 		{
 			g_fox += 4;
 		}
 	}
 
-/*
- * we now look at the sync line and then reset the time counters
- * when the sync switch is released.
- * */
-	if(g_enable_sync && (g_enable_start_timer || ((g_fox != FOXORING) && (g_fox != BEACON) && (g_fox != FOX_DEMO) && (g_fox != SPRINT_DEMO) && (g_fox != SPECTATOR))))
-	{
-		lb_send_string((char*)"Waiting for sync.\n", TRUE);
-		lb_send_string((char*)"Type \"GO\"\n", TRUE);
-		lb_send_NewPrompt();
-
-		while(( digitalRead(PIN_NANO_SYNC) == LOW) && !g_start_override)
-		{
-			if(g_enable_LEDs)
-			{
-				digitalWrite(PIN_NANO_LED, HIGH);   /* arduino nano LED turn on led to show sync switch is closed */
-			}
-
-			handleLinkBusMsgs();
-		}
-	}
-	else
-	{
-		lb_send_string((char*)"Tx is running!\n", TRUE);
-		lb_send_NewPrompt();
-	}
-
-	TCNT1 = 0;  /* Initialize 1-second counter value to 0 */
-	g_seconds_since_sync = 0;
-	g_fox_seconds_into_interval = 0;
-
-	g_start_override = TRUE;
+#if !HARDWARE_EXTERNAL_DIP_PULLUPS_INSTALLED
+		/* Disable pull-ups to save power */
+		pinMode(PIN_DIP_0, INPUT);  /* fox switch LSB */
+		pinMode(PIN_DIP_1, INPUT);  /* fox switch middle bit */
+		pinMode(PIN_DIP_2, INPUT);  /* fox switch MSB */
+		pinMode(PIN_DIP_0, OUTPUT);
+		pinMode(PIN_DIP_1, OUTPUT);
+		pinMode(PIN_DIP_2, OUTPUT);
+#endif  /* HARDWARE_EXTERNAL_DIP_PULLUPS_INSTALLED */
 
 	if((g_fox == BEACON) || (g_fox == SPECTATOR))
 	{
@@ -341,7 +352,7 @@ void wdt_init(WDReset resetType);
 
 	wdt_init(WD_HW_RESETS);
 
-#ifdef COMPILE_FOR_ATMELSTUDIO7
+#if COMPILE_FOR_ATMELSTUDIO7
 		while(1)
 		{
 			loop();
@@ -394,31 +405,24 @@ void __attribute__((optimize("O1"))) wdt_init(WDReset resetType)
 
 
 /***********************************************************************
- * Watchdog Timeout ISR
+ * Pin Change Interrupt 2 ISR
  *
- * The Watchdog timer helps prevent lockups due to hardware problems.
- * It is especially helpful in this application for preventing I2C bus
- * errors from locking up the foreground process.
+ * Handles SYNC pin operation
+ *
  ************************************************************************/
-ISR(WDT_vect)
+ISR(PCINT2_vect)
 {
-	static uint8_t limit = 10;
+	BOOL pinVal = digitalRead(3);
 
-/*	g_i2c_not_timed_out = FALSE;    / * unstick I2C * / */
-
-	/* Don't allow an unlimited number of WD interrupts to occur without enabling
-	 * hardware resets. But a limited number might be required during hardware
-	 * initialization. */
-/*	if(!g_enableHardwareWDResets && limit)
- *	{
- *		WDTCSR |= (1 << WDIE);  / * this prevents hardware resets from occurring * /
- *	} */
-
-	if(limit)
+	if(pinVal)  /* Sync is high */
 	{
-		limit--;
-/*		g_last_error_code = ERROR_CODE_WD_TIMEOUT; */
+		if(g_sync_pin_stable)
+		{
+			doSynchronization();
+		}
 	}
+
+	g_sync_pin_timer = 0;
 }
 
 
@@ -661,6 +665,7 @@ ISR(USART_UDRE_vect)
 	}
 }   /* End of UART Tx ISR */
 
+
 /***********************************************************************
  * Timer/Counter2 Compare Match B ISR
  *
@@ -676,6 +681,23 @@ ISR( TIMER2_COMPB_vect )
 	static int starting_boop = 0;
 	static BOOL playMorse = TRUE;
 	BOOL repeat = TRUE, finished = FALSE;
+
+	if(g_sync_enabled)
+	{
+		if(digitalRead(PIN_SYNC) == LOW)
+		{
+			if(g_sync_pin_timer < TIMER2_SECONDS_3)
+			{
+				g_sync_pin_timer++;
+			}
+
+			if(g_sync_pin_timer > TIMER2_SECONDS_1)
+			{
+				g_sync_pin_stable = TRUE;
+				digitalWrite(PIN_LED, HIGH);
+			}
+		}
+	}
 
 	if(blink_counter < -BLINK_LONG)
 	{
@@ -781,10 +803,10 @@ ISR( TIMER2_COMPB_vect )
 				{
 					if(g_enable_LEDs)
 					{
-						digitalWrite(PIN_NANO_LED, HIGH);   /*  Nano LED */
+						digitalWrite(PIN_LED, HIGH);    /*  LED */
 					}
 
-					digitalWrite(PIN_NANO_KEY, HIGH);       /* TX key line */
+					digitalWrite(PIN_MORSE_KEY, HIGH);  /* TX key line */
 				}
 
 				if(playMorse)
@@ -795,12 +817,12 @@ ISR( TIMER2_COMPB_vect )
 		}
 		else
 		{
-			if(g_enable_LEDs)
+			if(g_enable_LEDs && !g_sync_pin_stable)
 			{
-				digitalWrite(PIN_NANO_LED, key);    /*  nano LED */
+				digitalWrite(PIN_LED, key);     /*  LED */
 			}
 
-			digitalWrite(PIN_NANO_KEY, key);        /* TX key line */
+			digitalWrite(PIN_MORSE_KEY, key);   /* TX key line */
 			codeInc = g_code_throttle;
 			if(playMorse)
 			{
@@ -813,8 +835,11 @@ ISR( TIMER2_COMPB_vect )
 		if(key)
 		{
 			key = OFF;
-			digitalWrite(PIN_NANO_LED, LOW);    /*  nano LED */
-			digitalWrite(PIN_NANO_KEY, LOW);    /* TX key line */
+			if(!g_sync_pin_stable)
+			{
+				digitalWrite(PIN_LED, LOW);     /*  LED Off */
+			}
+			digitalWrite(PIN_MORSE_KEY, LOW);   /* TX key line */
 		}
 
 		if(playMorse)
@@ -836,9 +861,16 @@ ISR( TIMER2_COMPB_vect )
  * modified from ISR example for microfox by Jerry Boyd WB8WFK
  * this runs once a second and generates the cycle and sets control flags for the main controller.
  */
-ISR(TIMER1_COMPA_vect)      /*timer1 interrupt 1Hz */
+ISR(TIMER1_COMPA_vect)              /*timer1 interrupt 1Hz */
 {
 	static int id_countdown = 0;
+
+	if(g_seconds_since_sync == 0)   /* sync just occurred */
+	{
+		id_countdown = g_id_interval;
+		g_fox_counter = 1;
+		g_lastSeconds = 0;
+	}
 
 	g_seconds_since_sync++; /* Total elapsed time counter */
 	g_fox_seconds_into_interval++;
@@ -855,6 +887,15 @@ ISR(TIMER1_COMPA_vect)      /*timer1 interrupt 1Hz */
 		if(g_fox_counter > g_number_of_foxes)
 		{
 			g_fox_counter = 1;
+
+			if(g_sync_enabled)
+			{
+				PCMSK2 &= ~(1 << PCINT19);  /* Disable PCINT19 */
+				PCICR &= ~(1 << PCIE2);     /* Disable pin change interrupt 2 */
+				pinMode(PIN_SYNC, INPUT);
+				pinMode(PIN_SYNC, OUTPUT);  /* Set sync pin as output low */
+				g_sync_enabled = FALSE;
+			}
 		}
 		g_fox_transition = TRUE;
 		g_fox_seconds_into_interval = 0;
@@ -893,14 +934,10 @@ SIGNAL(TIMER0_COMPA_vect)
 		{
 			digitalWrite(PIN_AUDIO_OUT,OFF);
 		}
-
-		TCCR0A |= (1 << COM0A0);
 	}
 	else
 	{
-		TCCR0A = (1 << WGM01);
 		digitalWrite(PIN_AUDIO_OUT,OFF);
-/*		digitalWrite(6,OFF); */
 	}
 }
 
@@ -968,11 +1005,14 @@ void loop()
 			{
 				if(g_blinky_time)
 				{
-					digitalWrite(PIN_NANO_LED,OFF);
+					if(!g_sync_pin_stable)
+					{
+						digitalWrite(PIN_LED,OFF);
+					}
 				}
 				else
 				{
-					digitalWrite(PIN_NANO_LED,ON);
+					digitalWrite(PIN_LED,ON);
 				}
 			}
 		}
@@ -1072,15 +1112,11 @@ void __attribute__((optimize("O0"))) handleLinkBusMsgs()
 		{
 			case MESSAGE_RESET:
 			{
-#ifdef USE_WATCHDOG
-					wdt_init(WD_FORCE_RESET);
-					while(1)
-					{
-						;
-					}
-#else
-					resetFunc();    /*call reset */
-#endif /* USE_WATCHDOG */
+				wdt_init(WD_FORCE_RESET);
+				while(1)
+				{
+					;
+				}
 			}
 			break;
 
@@ -1137,7 +1173,7 @@ void __attribute__((optimize("O0"))) handleLinkBusMsgs()
 						{
 							x = BEACON;
 						}
-						if(t == 'F')
+						else if(t == 'F')
 						{
 							if((u > '0') && (u < '6'))
 							{
@@ -1170,7 +1206,7 @@ void __attribute__((optimize("O0"))) handleLinkBusMsgs()
 							}
 						}
 
-						if(x)
+						if(x != BEACON)
 						{
 							c = CLAMP(SPECTATOR,x,SPRINT_F5);
 						}
@@ -1214,27 +1250,6 @@ void __attribute__((optimize("O0"))) handleLinkBusMsgs()
 			}
 			break;
 
-			case MESSAGE_SYNC_ENABLE:
-			{
-				if(lb_buff->fields[FIELD1][0])
-				{
-					if((lb_buff->fields[FIELD1][1] == 'F') || (lb_buff->fields[FIELD1][0] == '0'))
-					{
-						g_enable_sync = FALSE;
-					}
-					else
-					{
-						g_enable_sync = TRUE;
-					}
-
-					saveAllEEPROM();
-				}
-
-				sprintf(g_tempStr,"SYN:%s\n",g_enable_sync ? "ON" : "OFF");
-				lb_send_string(g_tempStr,FALSE);
-			}
-			break;
-
 			case MESSAGE_STARTTONES_ENABLE:
 			{
 				if(lb_buff->fields[FIELD1][0])
@@ -1258,15 +1273,8 @@ void __attribute__((optimize("O0"))) handleLinkBusMsgs()
 
 			case MESSAGE_GO:
 			{
-				if(g_start_override)
-				{
-					lb_send_string((char*)"Already synced!\n",FALSE);
-				}
-				else
-				{
-					g_start_override = TRUE;
-					lb_send_string((char*)"Running!\n",FALSE);
-				}
+				doSynchronization();
+				lb_send_string((char*)"Re-sync successful!\n",FALSE);
 			}
 			break;
 
@@ -1274,15 +1282,18 @@ void __attribute__((optimize("O0"))) handleLinkBusMsgs()
 			{
 				uint8_t flag = EEPROM_INITIALIZED_FLAG + 1;
 				eeprom_write_byte(&ee_interface_eeprom_initialization_flag,flag);
-#ifdef USE_WATCHDOG
-					wdt_init(WD_FORCE_RESET);
-					while(1)
-					{
-						;
-					}
-#else
-					resetFunc();    /*call reset */
-#endif /* USE_WATCHDOG */
+				g_clock_calibration = 0xFFFF;
+				eeprom_update_word(&ee_clock_calibration,g_clock_calibration);
+				for(uint8_t i = 0; i < strlen(g_messages_text[STATION_ID]); i++)
+				{
+					eeprom_write_byte((uint8_t*)&ee_stationID_text,0xFF);
+				}
+
+				wdt_init(WD_FORCE_RESET);
+				while(1)
+				{
+					;
+				}
 			}
 			break;
 
@@ -1411,7 +1422,7 @@ void __attribute__((optimize("O0"))) handleLinkBusMsgs()
 				}
 
 				float temp = 10. * getTemp();
-				sprintf(g_tempStr,"Temp: %d.%dC\n",(int)temp / 10,(int)temp % 10);
+				sprintf(g_tempStr,"Temp: %d.%dC\n",(int)temp / 10,abs((int)temp % 10));
 				lb_send_string(g_tempStr,FALSE);
 			}
 			break;
@@ -1449,7 +1460,6 @@ BOOL initializeEEPROMVars()
 		g_temp_calibration = (int16_t)eeprom_read_word((uint16_t*)&ee_temp_calibration);
 		g_override_DIP_switches = eeprom_read_byte(&ee_override_DIP_switches);
 		g_enable_LEDs = eeprom_read_byte(&ee_enable_LEDs);
-		g_enable_sync = eeprom_read_byte(&ee_enable_sync);
 		g_enable_start_timer = eeprom_read_byte(&ee_enable_start_timer);
 
 		for(i = 0; i < 20; i++)
@@ -1480,7 +1490,6 @@ BOOL initializeEEPROMVars()
 		g_temp_calibration = EEPROM_TEMP_CALIBRATION_DEFAULT;
 		g_override_DIP_switches = EEPROM_OVERRIDE_DIP_SW_DEFAULT;
 		g_enable_LEDs = EEPROM_ENABLE_LEDS_DEFAULT;
-		g_enable_sync = EEPROM_ENABLE_SYNC_DEFAULT;
 		g_enable_start_timer = EEPROM_ENABLE_STARTTIMER_DEFAULT;
 		strncpy(g_messages_text[STATION_ID],EEPROM_STATION_ID_DEFAULT,MAX_PATTERN_TEXT_LENGTH);
 		strncpy(g_messages_text[PATTERN_TEXT],EEPROM_PATTERN_TEXT_DEFAULT,MAX_PATTERN_TEXT_LENGTH);
@@ -1510,7 +1519,6 @@ void saveAllEEPROM()
 	eeprom_update_word((uint16_t*)&ee_temp_calibration,(uint16_t)g_temp_calibration);
 	eeprom_update_byte(&ee_override_DIP_switches,g_override_DIP_switches);
 	eeprom_update_byte(&ee_enable_LEDs,g_enable_LEDs);
-	eeprom_update_byte(&ee_enable_sync,g_enable_sync);
 	eeprom_update_byte(&ee_enable_start_timer,g_enable_start_timer);
 
 	for(i = 0; i < strlen(g_messages_text[STATION_ID]); i++)
@@ -1587,10 +1595,24 @@ uint16_t readADC()
  */
 float getTemp(void)
 {
-	float offset = (float)g_temp_calibration / 10.;
+	float offset = CLAMP(-200.,(float)g_temp_calibration / 10.,200.);
 
 	/* The offset (first term) was determined empirically */
 	readADC();  /* throw away first reading */
 	return(offset + (readADC() - 324.31) / 1.22);
+}
+
+
+void doSynchronization(void)
+{
+	cli();
+	TCNT1 = 0;  /* Initialize 1-second counter value to 0 */
+	g_seconds_since_sync = 0;
+	g_fox_seconds_into_interval = 0;
+	g_sync_pin_stable = FALSE;
+	digitalWrite(PIN_LED,LOW);
+	g_on_the_air = 0;
+	g_fox_counter = 1;  /* Don't count on the 1-sec timer setting this in time */
+	sei();
 }
 
